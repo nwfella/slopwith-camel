@@ -1,0 +1,1776 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sopwith Camel — Enhanced</title>
+<style>
+/* === RESET & FULLSCREEN CANVAS === */
+*,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
+html,body{width:100%;height:100%;overflow:hidden;background:#06060e;font-family:'Courier New',monospace}
+canvas{display:block;width:100%;height:100%;image-rendering:pixelated;touch-action:none}
+#startOverlay{position:fixed;inset:0;background:rgba(6,6,14,.92);display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:10;cursor:pointer;user-select:none}
+#startOverlay h1{color:#0ff;font-size:clamp(32px,8vw,72px);text-shadow:0 0 30px #0ff,0 0 60px #0ff6;letter-spacing:6px;margin-bottom:8px}
+#startOverlay .subtitle{color:#f80;font-size:clamp(14px,3vw,28px);text-shadow:0 0 20px #f80;margin-bottom:32px;letter-spacing:3px}
+#startOverlay .controls{color:#8af;font-size:clamp(10px,1.8vw,16px);line-height:2;text-align:center;opacity:.8}
+#startOverlay .controls span{color:#ff0}
+#startOverlay .prompt{color:#fff;font-size:clamp(12px,2.2vw,20px);margin-top:32px;animation:pulse 1.5s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:.5}50%{opacity:1}}
+#startOverlay .credits{color:#666;font-size:12px;position:absolute;bottom:24px;text-align:center}
+</style>
+</head>
+<body>
+
+<div id="startOverlay">
+  <h1>✦ SOPWITH CAMEL ✦</h1>
+  <div class="subtitle">— ENHANCED —</div>
+  <div class="controls">
+    ↑↓ Pitch &nbsp;|&nbsp; X Accel &nbsp;|&nbsp; Z Brake<br>
+    <span>SPACE</span> Fire &nbsp;|&nbsp; <span>B</span> Bomb<br>
+    Return to runway to refuel &amp; reload
+  </div>
+  <div class="prompt">▸ CLICK or TAP to START ◂</div>
+  <div class="credits">A tribute to the 1984 classic • Built with HTML5 Canvas &amp; Web Audio</div>
+</div>
+
+<canvas id="gameCanvas"></canvas>
+
+<script>
+/* ============================================================
+   SOPWITH CAMEL — Enhanced
+   Complete HTML5 Canvas biplane dogfight game.
+   Zero external dependencies. All audio synthesized via Web Audio API.
+   ============================================================ */
+
+// =========================================================
+// SECTION 1 — CONSTANTS & CONFIGURATION
+// =========================================================
+const CFG = {
+  WORLD_W:      16384,  // world width (looping)
+  GRAVITY:      0.14,
+  THRUST_FORCE: 0.25,
+  MAX_SPEED:    9.0,
+  MIN_SPEED:    1.2,
+  DRAG:         0.008,
+  STALL_SPEED:  2.2,
+  PITCH_RATE:   0.038,  // radians per frame
+  BULLET_SPD:   10,
+  BULLET_LIFE:  90,
+  BOMB_SPD:     2.5,
+  FIRE_RATE:    8,      // frames between shots
+  BOMB_COOLDOWN:30,
+  MAX_BULLETS:  200,
+  MAX_BOMBS:    8,
+  MAX_FUEL:     6000,
+  FUEL_BURN:    0.15,
+  REFUEL_RATE:  3,
+  HOME_BASE_X:  4000,
+  RUNWAY_LEN:   350,
+  SPAWN_INTERVAL: 360,
+  MAX_ENEMIES:  4,
+  ENEMY_SPEED:  2.5,
+  SCORE_OIL:    100,
+  SCORE_FACTORY:500,
+  SCORE_ENEMY:  250,
+  SCORE_AA:     150,
+  CANVAS_W: 0,  // set at init
+  CANVAS_H: 0,
+};
+
+// =========================================================
+// SECTION 2 — UTILITY
+// =========================================================
+const PI = Math.PI, TAU = PI * 2, HALF_PI = PI / 2;
+
+function clamp(v, mn, mx) { return v < mn ? mn : v > mx ? mx : v; }
+
+function lerp(a, b, t) { return a + (b - a) * t; }
+
+function dist(x1, y1, x2, y2) {
+  let dx = Math.abs(x1 - x2);
+  if (dx > CFG.WORLD_W / 2) dx = CFG.WORLD_W - dx;
+  return Math.sqrt(dx * dx + (y1 - y2) * (y1 - y2));
+}
+
+function worldDelta(wx1, wx2) {
+  let d = wx1 - wx2;
+  if (d > CFG.WORLD_W / 2) d -= CFG.WORLD_W;
+  else if (d < -CFG.WORLD_W / 2) d += CFG.WORLD_W;
+  return d;
+}
+
+function wrapX(x) {
+  while (x < 0) x += CFG.WORLD_W;
+  while (x >= CFG.WORLD_W) x -= CFG.WORLD_W;
+  return x;
+}
+
+// Seeded LCG for deterministic placement
+let _seed = 12345;
+function srand(s) { _seed = ((s || _seed) * 9301 + 49297) & 0x7fffffff; return (_seed & 0x7fffffff) / 0x7fffffff; }
+function randInt(min, max, seed) { return min + Math.floor(srand(seed) * (max - min + 1)); }
+
+// =========================================================
+// SECTION 3 — AUDIO SYNTHESIZER (Web Audio API)
+// =========================================================
+let audioCtx = null;
+let muted = false;
+function initAudio() {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+}
+
+function playTone(freq, dur, type, vol) {
+  if (!audioCtx || muted) return;
+  const t = audioCtx.currentTime;
+  const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+  o.type = type || 'sine';
+  o.frequency.setValueAtTime(freq, t);
+  g.gain.setValueAtTime(vol || 0.12, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+  o.connect(g); g.connect(audioCtx.destination);
+  o.start(t); o.stop(t + dur);
+}
+
+function playNoise(dur, vol, freqStart, freqEnd) {
+  if (!audioCtx || muted) return;
+  const t = audioCtx.currentTime;
+  const sr = audioCtx.sampleRate;
+  const buf = audioCtx.createBuffer(1, Math.ceil(sr * dur), sr);
+  const d = buf.getChannelData(0);
+  for (let i = 0; i < d.length; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / d.length, 1.5);
+  const src = audioCtx.createBufferSource();
+  src.buffer = buf;
+  const g = audioCtx.createGain();
+  g.gain.setValueAtTime(vol || 0.15, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+  if (freqStart !== undefined) {
+    const f = audioCtx.createBiquadFilter();
+    f.type = 'lowpass';
+    f.frequency.setValueAtTime(freqStart, t);
+    f.frequency.exponentialRampToValueAtTime(freqEnd || 50, t + dur);
+    src.connect(f); f.connect(g);
+  } else {
+    src.connect(g);
+  }
+  g.connect(audioCtx.destination);
+  src.start(t); src.stop(t + dur);
+}
+
+const SFX = {
+  shoot() { playTone(1200, 0.05, 'square', 0.07); },
+  bombDrop() { playTone(300, 0.15, 'sawtooth', 0.1, 80); },
+  explosion() { playNoise(0.45, 0.25, 900, 40); },
+  hit() { playTone(200, 0.08, 'sawtooth', 0.06); },
+  stall() { playTone(80, 0.2, 'sawtooth', 0.05); },
+  land() { playTone(440, 0.15, 'sine', 0.08, 880); },
+  die() { playNoise(0.6, 0.35, 600, 30); playTone(150, 0.5, 'sawtooth', 0.1, 40); },
+  scorePop() { const t = audioCtx ? audioCtx.currentTime : 0; playTone(880, 0.1, 'sine', 0.1); if(audioCtx) playToneAt(1100, t+0.07, 0.12, 'sine', 0.1); },
+  gameOver() { playNoise(0.8, 0.3, 500, 20); playTone(200, 0.8, 'sawtooth', 0.08, 50); },
+};
+
+// playToneAt for scheduled tones (prevents setTimeout jank)
+function playToneAt(freq, startTime, dur, type, vol) {
+  if (!audioCtx || muted) return;
+  const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+  o.type = type || 'sine';
+  o.frequency.setValueAtTime(freq, startTime);
+  g.gain.setValueAtTime(vol || 0.12, startTime);
+  g.gain.exponentialRampToValueAtTime(0.001, startTime + dur);
+  o.connect(g); g.connect(audioCtx.destination);
+  o.start(startTime); o.stop(startTime + dur);
+}
+
+// =========================================================
+// SECTION 4 — PARTICLE SYSTEM (Object Pool)
+// =========================================================
+const MAX_PARTICLES = 800;
+let particlePool = [];
+for (let i = 0; i < MAX_PARTICLES; i++) {
+  particlePool.push({ alive: false, x: 0, y: 0, vx: 0, vy: 0, life: 0, maxLife: 0, size: 0, grow: 0, r: 255, g: 255, b: 255, dr: 0, dg: 0, db: 0, type: 'fire', gravity: 0 });
+}
+
+let activeParticles = 0;
+
+function spawnParticles(x, y, count, opts = {}) {
+  const {
+    vxRange = 2, vyRange = 2, lifeRange = [20, 50],
+    sizeRange = [2, 5], grow = 0, colors = [[255,200,50],[255,100,20],[255,50,50]],
+    type = 'fire', gravity = 0.02
+  } = opts;
+  for (let i = 0; i < count && activeParticles < MAX_PARTICLES; i++) {
+    let p = null;
+    for (let j = 0; j < MAX_PARTICLES; j++) {
+      if (!particlePool[j].alive) { p = particlePool[j]; break; }
+    }
+    if (!p) break;
+    const maxL = lifeRange[0] + srand() * (lifeRange[1] - lifeRange[0]);
+    const c = colors[Math.floor(srand() * colors.length)];
+    p.alive = true;
+    p.x = x + (srand() - 0.5) * 4;
+    p.y = y + (srand() - 0.5) * 4;
+    p.vx = (srand() - 0.5) * vxRange * 2;
+    p.vy = (srand() - 0.5) * vyRange * 2 - vyRange * 0.3;
+    p.life = maxL;
+    p.maxLife = maxL;
+    p.size = sizeRange[0] + srand() * (sizeRange[1] - sizeRange[0]);
+    p.grow = grow;
+    p.r = c[0]; p.g = c[1]; p.b = c[2];
+    p.dr = -c[0] / maxL; p.dg = -c[1] / maxL; p.db = -c[2] / maxL;
+    p.type = type;
+    p.gravity = gravity;
+    activeParticles++;
+  }
+}
+
+function spawnExplosion(x, y, size = 1) {
+  const cnt = Math.floor(40 * size);
+  spawnParticles(x, y, cnt, {
+    vxRange: 4 * size, vyRange: 4 * size,
+    lifeRange: [20, 60], sizeRange: [2, 6 * size], grow: -0.02,
+    colors: [[255,255,100],[255,200,50],[255,100,20],[255,50,0],[200,0,0]],
+    gravity: 0.01
+  });
+  // Smoke ring
+  spawnParticles(x, y, Math.floor(15 * size), {
+    vxRange: 2 * size, vyRange: 2 * size,
+    lifeRange: [40, 90], sizeRange: [3, 8 * size], grow: 0.15,
+    colors: [[100,100,100],[80,80,80],[60,60,60],[40,40,40]],
+    type: 'smoke', gravity: -0.01
+  });
+  // Debris sparks
+  spawnParticles(x, y, Math.floor(10 * size), {
+    vxRange: 6 * size, vyRange: 5 * size,
+    lifeRange: [15, 35], sizeRange: [1, 3], grow: -0.05,
+    colors: [[255,255,200],[255,200,100]],
+    gravity: 0.05
+  });
+}
+
+function updateParticles() {
+  for (let i = 0; i < MAX_PARTICLES; i++) {
+    const p = particlePool[i];
+    if (!p.alive) continue;
+    p.x += p.vx;
+    p.y += p.vy;
+    p.vy += p.gravity;
+    p.vx *= 0.98;
+    p.vy *= 0.98;
+    p.life--;
+    p.size += p.grow;
+    if (p.size < 0.1) p.size = 0.1;
+    p.r += p.dr; p.g += p.dg; p.b += p.db;
+    if (p.r < 0) p.r = 0; if (p.g < 0) p.g = 0; if (p.b < 0) p.b = 0;
+    if (p.life <= 0) { p.alive = false; activeParticles--; }
+  }
+}
+
+function drawParticles(ctx, camX, camY) {
+  for (let i = 0; i < MAX_PARTICLES; i++) {
+    const p = particlePool[i];
+    if (!p.alive) continue;
+    const dx = worldDelta(p.x, camX);
+    const sx = CFG.CANVAS_W / 2 + dx;
+    const sy = CFG.CANVAS_H / 2 + (p.y - camY);
+    if (sx < -20 || sx > CFG.CANVAS_W + 20 || sy < -20 || sy > CFG.CANVAS_H + 20) continue;
+    const alpha = clamp(p.life / p.maxLife, 0, 1);
+    const sz = Math.max(p.size, 0.5);
+    if (p.type === 'smoke') {
+      ctx.globalAlpha = alpha * 0.4;
+      ctx.fillStyle = `rgb(${p.r|0},${p.g|0},${p.b|0})`;
+      ctx.beginPath();
+      ctx.arc(sx, sy, sz, 0, TAU);
+      ctx.fill();
+    } else {
+      ctx.globalAlpha = alpha;
+      ctx.fillStyle = `rgb(${p.r|0},${p.g|0},${p.b|0})`;
+      ctx.fillRect(sx - sz / 2, sy - sz / 2, sz, sz);
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
+// =========================================================
+// SECTION 5 — TERRAIN GENERATOR
+// =========================================================
+let terrain = new Float32Array(CFG.WORLD_W);
+let terrainBase = 400;
+
+function generateTerrain() {
+  // Composite sine waves for natural terrain that perfectly loops
+  const f1 = TAU / CFG.WORLD_W * 3,  a1 = 50;  // 3 hills
+  const f2 = TAU / CFG.WORLD_W * 7,  a2 = 30;  // 7 medium
+  const f3 = TAU / CFG.WORLD_W * 17, a3 = 18;  // 17 small
+  const f4 = TAU / CFG.WORLD_W * 43, a4 = 8;   // 43 bumps
+  const f5 = TAU / CFG.WORLD_W * 2,  a5 = 25;  // 2 large valleys
+
+  for (let i = 0; i < CFG.WORLD_W; i++) {
+    let h = 0;
+    h += Math.sin(i * f1 + 0.3) * a1;
+    h += Math.sin(i * f2 + 1.7) * a2;
+    h += Math.sin(i * f3 + 2.1) * a3;
+    h += Math.sin(i * f4 + 4.5) * a4;
+    h += Math.sin(i * f5 + 0.8) * a5;
+    terrain[i] = terrainBase + h;
+  }
+
+  // Flatten home base runway
+  const base = CFG.HOME_BASE_X;
+  const halfR = CFG.RUNWAY_LEN / 2;
+  const runwayY = terrain[base];
+  for (let i = base - halfR; i <= base + halfR; i++) {
+    const idx = wrapX(i);
+    // Smooth transition at edges
+    const dist = Math.abs(i - base);
+    const t = clamp((dist - halfR + 30) / 30, 0, 1);
+    terrain[idx] = lerp(runwayY, terrain[idx], t * t);
+  }
+}
+
+function getTerrainHeight(wx) {
+  const idx = Math.round(wrapX(wx));
+  return terrain[idx] || terrainBase;
+}
+
+function isOnRunway(wx) {
+  const dx = worldDelta(wx, CFG.HOME_BASE_X);
+  return Math.abs(dx) < CFG.RUNWAY_LEN / 2 - 10;
+}
+
+// =========================================================
+// SECTION 6 — CAMERA
+// =========================================================
+const camera = { x: 0, y: 0, shake: 0, shakeX: 0, shakeY: 0 };
+
+function updateCamera(targetX, targetY) {
+  const cx = CFG.CANVAS_W / 2, cy = CFG.CANVAS_H / 2;
+  // Smooth follow with world wrapping awareness
+  let dx = worldDelta(targetX, camera.x);
+  let dy = targetY - camera.y;
+  camera.x += dx * 0.08;
+  camera.y += dy * 0.08;
+  // Screen shake decay
+  if (camera.shake > 0) {
+    camera.shake *= 0.88;
+    camera.shakeX = (srand() - 0.5) * camera.shake * 12;
+    camera.shakeY = (srand() - 0.5) * camera.shake * 12;
+    if (camera.shake < 0.1) camera.shake = 0;
+  } else {
+    camera.shakeX = 0;
+    camera.shakeY = 0;
+  }
+}
+
+function triggerShake(intensity) {
+  camera.shake = Math.max(camera.shake, intensity);
+}
+
+function worldToScreen(wx, wy) {
+  const dx = worldDelta(wx, camera.x);
+  return {
+    x: CFG.CANVAS_W / 2 + dx + camera.shakeX,
+    y: CFG.CANVAS_H / 2 + (wy - camera.y) + camera.shakeY
+  };
+}
+
+// =========================================================
+// SECTION 7 — PROJECTILES (Bullets, Bombs, Flak)
+// =========================================================
+let bullets = [];
+let bombs = [];
+let flak = [];
+
+function fireBullet(x, y, angle) {
+  if (game.bullets <= 0) return;
+  game.bullets--;
+  bullets.push({
+    x, y,
+    vx: Math.cos(angle) * CFG.BULLET_SPD,
+    vy: Math.sin(angle) * CFG.BULLET_SPD,
+    life: CFG.BULLET_LIFE,
+  });
+  SFX.shoot();
+}
+
+function dropBomb(x, y, vx, vy) {
+  if (game.bombs <= 0) return;
+  game.bombs--;
+  bombs.push({ x, y, vx: vx * 0.5, vy: vy + 0.5, life: 400 });
+  SFX.bombDrop();
+}
+
+function fireFlak(x, y, targetX, targetY) {
+  const dx = worldDelta(targetX, x);
+  const dy = targetY - y;
+  const dist = Math.sqrt(dx * dx + dy * dy);
+  if (dist === 0) return;
+  const baseAngle = Math.atan2(dy, dx);
+  // Burst of 3-5 pellets with spread
+  const count = 3 + Math.floor(srand() * 3);
+  const speed = 4 + srand() * 2;
+  for (let i = 0; i < count; i++) {
+    const spread = (srand() - 0.5) * 0.5;
+    const angle = baseAngle + spread;
+    flak.push({
+      x, y,
+      vx: Math.cos(angle) * speed,
+      vy: Math.sin(angle) * speed,
+      life: 60 + srand() * 30,
+    });
+  }
+  playNoise(0.08, 0.06, 2000, 400);
+}
+
+function updateProjectiles() {
+  // Bullets
+  for (let i = bullets.length - 1; i >= 0; i--) {
+    const b = bullets[i];
+    b.x += b.vx;
+    b.y += b.vy;
+    b.life--;
+    if (b.life <= 0 || b.y > getTerrainHeight(b.x) + 5) {
+      bullets.splice(i, 1);
+    }
+  }
+
+  // Bombs
+  for (let i = bombs.length - 1; i >= 0; i--) {
+    const b = bombs[i];
+    b.vy += 0.15; // gravity on bomb
+    b.x += b.vx;
+    b.y += b.vy;
+    b.life--;
+    if (b.life <= 0 || b.y > getTerrainHeight(b.x)) {
+      if (b.life > 0) {
+        // Bomb hit ground — explosion
+        spawnExplosion(b.x, b.y, 0.8);
+        triggerShake(0.3);
+        SFX.explosion();
+        checkBombDamage(b.x, b.y);
+      }
+      bombs.splice(i, 1);
+    }
+  }
+
+  // Flak pellets
+  for (let i = flak.length - 1; i >= 0; i--) {
+    const f = flak[i];
+    f.x += f.vx;
+    f.y += f.vy;
+    f.vy += 0.02; // slight gravity
+    f.life--;
+    if (f.life <= 0 || f.y > getTerrainHeight(f.x)) {
+      flak.splice(i, 1);
+    }
+  }
+}
+
+function checkBombDamage(bx, by) {
+  for (let i = game.targets.length - 1; i >= 0; i--) {
+    const t = game.targets[i];
+    if (!t.alive) continue;
+    if (dist(bx, by, t.x, t.y) < 60) {
+      destroyTarget(t);
+    }
+  }
+  // Also damage nearby enemies
+  for (let i = game.enemies.length - 1; i >= 0; i--) {
+    const e = game.enemies[i];
+    if (!e.alive) continue;
+    if (dist(bx, by, e.x, e.y) < 70) {
+      destroyEnemy(e);
+    }
+  }
+}
+
+// =========================================================
+// SECTION 8 — TARGETS (Oil Tanks, Factories, AA Guns)
+// =========================================================
+function createTargets() {
+  const targets = [];
+  // Place targets across the world (skip home base area)
+  const baseStart = CFG.HOME_BASE_X - CFG.RUNWAY_LEN;
+  const baseEnd = CFG.HOME_BASE_X + CFG.RUNWAY_LEN;
+
+  for (let x = 200; x < CFG.WORLD_W - 200; x += 200 + Math.floor(srand(x * 13) * 200)) {
+    if (x > baseStart - 100 && x < baseEnd + 100) continue;
+
+    const ty = getTerrainHeight(x);
+    const typeRand = srand(x * 7);
+    if (typeRand < 0.35) {
+      // Oil tank
+      targets.push({
+        type: 'oil', x, y: ty, w: 28, h: 22, hp: 3, maxHp: 3,
+        alive: true, drawFn: drawOilTank
+      });
+    } else if (typeRand < 0.55) {
+      // Factory (larger, needs bombs)
+      targets.push({
+        type: 'factory', x, y: ty, w: 50, h: 30, hp: 10, maxHp: 10,
+        alive: true, bombOnly: true, drawFn: drawFactory
+      });
+    } else if (typeRand < 0.75) {
+      // AA Gun
+      targets.push({
+        type: 'aa', x, y: ty, w: 20, h: 16, hp: 3, maxHp: 3,
+        alive: true, cooldown: 0, drawFn: drawAAGun
+      });
+    }
+    // else leave empty space
+  }
+  return targets;
+}
+
+function drawOilTank(ctx, t, sx, sy) {
+  const color = t.hp > 1 ? '#448' : '#844';
+  ctx.fillStyle = color;
+  ctx.strokeStyle = '#66a';
+  ctx.lineWidth = 2;
+  // Cylinder body
+  ctx.beginPath();
+  ctx.arc(sx, sy - 10, 14, PI, 0);
+  ctx.lineTo(sx + 14, sy);
+  ctx.arc(sx, sy, 14, 0, PI);
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+  // Top detail
+  ctx.fillStyle = '#556';
+  ctx.fillRect(sx - 4, sy - 24, 8, 6);
+  ctx.fillStyle = '#ff4';
+  ctx.fillRect(sx - 2, sy - 22, 4, 3);
+  // Highlight
+  ctx.fillStyle = 'rgba(255,255,255,0.15)';
+  ctx.fillRect(sx - 10, sy - 16, 6, 18);
+  // HP indicator
+  if (t.hp < t.maxHp) {
+    ctx.fillStyle = t.hp > 1 ? '#ff0' : '#f44';
+    ctx.fillRect(sx - 6, sy + 4, 12 * (t.hp / t.maxHp), 2);
+  }
+}
+
+function drawFactory(ctx, t, sx, sy) {
+  ctx.fillStyle = '#443';
+  ctx.strokeStyle = '#775';
+  ctx.lineWidth = 2;
+  // Main building
+  ctx.fillRect(sx - 24, sy - 28, 48, 28);
+  ctx.strokeRect(sx - 24, sy - 28, 48, 28);
+  // Roof
+  ctx.fillStyle = '#554';
+  ctx.beginPath();
+  ctx.moveTo(sx - 26, sy - 28);
+  ctx.lineTo(sx, sy - 40);
+  ctx.lineTo(sx + 26, sy - 28);
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+  // Chimney
+  ctx.fillStyle = '#333';
+  ctx.fillRect(sx + 10, sy - 48, 8, 20);
+  ctx.fillStyle = '#f80';
+  ctx.fillRect(sx + 11, sy - 50, 6, 4);
+  // Windows
+  ctx.fillStyle = '#664';
+  for (let i = 0; i < 3; i++) {
+    ctx.fillRect(sx - 16 + i * 14, sy - 22, 8, 8);
+    ctx.fillStyle = '#886';
+  }
+  // Damage
+  if (t.hp < t.maxHp) {
+    ctx.fillStyle = 'rgba(255,0,0,0.3)';
+    ctx.fillRect(sx - 24, sy - 28, 48, 28);
+  }
+}
+
+function drawAAGun(ctx, t, sx, sy) {
+  // Base platform
+  ctx.fillStyle = '#444';
+  ctx.fillRect(sx - 10, sy - 4, 20, 4);
+  // Pedestal
+  ctx.fillStyle = '#555';
+  ctx.fillRect(sx - 4, sy - 10, 8, 6);
+  // Rotating barrel (always tracks player if alive)
+  const dx = worldDelta(game.player.x, t.x);
+  const dy = game.player.y - t.y - 8;
+  const angle = Math.atan2(dy, dx);
+  ctx.save();
+  ctx.translate(sx, sy - 10);
+  ctx.rotate(angle);
+  ctx.fillStyle = '#666';
+  ctx.fillRect(0, -2, 18, 4);
+  ctx.fillStyle = '#844';
+  ctx.fillRect(14, -3, 6, 6);
+  ctx.restore();
+  // Body
+  ctx.fillStyle = '#555';
+  ctx.beginPath();
+  ctx.arc(sx, sy - 10, 6, 0, TAU);
+  ctx.fill();
+  ctx.fillStyle = '#666';
+  ctx.beginPath();
+  ctx.arc(sx, sy - 10, 3, 0, TAU);
+  ctx.fill();
+}
+
+function destroyTarget(t) {
+  if (!t.alive) return;
+  t.alive = false;
+  spawnExplosion(t.x, t.y - 10, 1.2);
+  triggerShake(0.6);
+  SFX.explosion();
+  if (t.type === 'oil') game.score += CFG.SCORE_OIL;
+  else if (t.type === 'factory') game.score += CFG.SCORE_FACTORY;
+  else if (t.type === 'aa') game.score += CFG.SCORE_AA;
+}
+
+// =========================================================
+// SECTION 9 — PLAYER & ENEMY PLANES
+// =========================================================
+function createPlayer() {
+  const baseY = getTerrainHeight(CFG.HOME_BASE_X) - 60;
+  return {
+    x: CFG.HOME_BASE_X, y: baseY,
+    vx: 3, vy: 0,
+    angle: 0, displayAngle: 0,
+    thrust: 0.5,
+    hp: 100, maxHp: 100,
+    fuel: CFG.MAX_FUEL,
+    bullets: CFG.MAX_BULLETS,
+    bombs: CFG.MAX_BOMBS,
+    fireCooldown: 0,
+    bombCooldown: 0,
+    onGround: false,
+    alive: true,
+    respawnTimer: 0,
+    invincible: 0,
+    smokeTimer: 0,
+    enginePhase: 0,
+  };
+}
+
+function createEnemy(x, y) {
+  return {
+    x, y, vx: CFG.ENEMY_SPEED * (srand() > 0.5 ? 1 : -1), vy: 0,
+    angle: 0, displayAngle: 0,
+    thrust: 0.6 + srand() * 0.3,
+    hp: 5, maxHp: 5,
+    alive: true,
+    fireCooldown: 60 + Math.floor(srand() * 120),
+    turnTimer: 0,
+    diveTimer: 0,
+    state: 'patrol', // patrol, chase, dive, climb
+    enginePhase: srand() * TAU,
+  };
+}
+
+function updatePlanePhysics(p) {
+  // Angle control (only for player — enemies set angle differently)
+  if (p === game.player) {
+    if (game.keys['ArrowUp']) p.angle -= CFG.PITCH_RATE;
+    if (game.keys['ArrowDown']) p.angle += CFG.PITCH_RATE;
+  }
+
+  // Thrust
+  const thrustMag = p.thrust * CFG.THRUST_FORCE;
+  p.vx += Math.cos(p.angle) * thrustMag;
+  p.vy += Math.sin(p.angle) * thrustMag;
+
+  // Gravity
+  p.vy += CFG.GRAVITY;
+
+  // Drag (proportional to speed^2)
+  const speed = Math.sqrt(p.vx * p.vx + p.vy * p.vy);
+  if (speed > 0) {
+    const drag = 1 - Math.min(CFG.DRAG * speed, 0.5);
+    p.vx *= drag;
+    p.vy *= drag;
+  }
+
+  // Clamp speed
+  const newSpeed = Math.sqrt(p.vx * p.vx + p.vy * p.vy);
+  if (newSpeed > CFG.MAX_SPEED) {
+    const ratio = CFG.MAX_SPEED / newSpeed;
+    p.vx *= ratio;
+    p.vy *= ratio;
+  }
+
+  // Stall — when speed too low and nose is up
+  if (newSpeed < CFG.STALL_SPEED && p.angle < -0.15) {
+    p.vy += CFG.GRAVITY * 0.3; // extra gravity during stall
+    if (p === game.player && Math.floor(game.frame % 12) === 0) SFX.stall();
+  }
+
+  // Update position
+  p.x = wrapX(p.x + p.vx);
+  p.y += p.vy;
+  p.enginePhase += 0.15;
+
+  // Smooth display angle
+  let angleDiff = p.angle - p.displayAngle;
+  if (angleDiff > PI) angleDiff -= TAU;
+  if (angleDiff < -PI) angleDiff += TAU;
+  p.displayAngle += angleDiff * 0.12;
+
+  // Ground collision
+  const groundY = getTerrainHeight(p.x);
+  if (p.y > groundY - 8) {
+    p.y = groundY - 8;
+    p.vy = 0;
+    // Check landing (player only, on runway)
+    if (p === game.player) {
+      if (!p.onGround) {
+        if (isOnRunway(p.x) && newSpeed < 6 && Math.abs(p.angle) < 0.4) {
+          p.onGround = true;
+          SFX.land();
+          spawnParticles(p.x, groundY, 8, {
+            vxRange: 1, vyRange: 0.5, lifeRange: [10,25], sizeRange: [2,5],
+            colors: [[180,160,120],[160,140,100]], gravity: -0.02
+          });
+        } else {
+          // Crash!
+          crashPlane(p);
+        }
+      }
+      // Stay on ground while on runway
+      if (p.onGround) {
+        p.vx *= 0.9;
+        p.vy = 0;
+        p.y = groundY - 8;
+        p.angle = 0;
+        p.displayAngle = 0;
+        // Refuel & reload
+        p.fuel = Math.min(CFG.MAX_FUEL, p.fuel + CFG.REFUEL_RATE);
+        p.bullets = Math.min(CFG.MAX_BULLETS, p.bullets + 2);
+        if (p.bombs < CFG.MAX_BOMBS && game.frame % 20 === 0) p.bombs++;
+      }
+    } else {
+      // Enemy ground collision = immediate death
+      crashPlane(p);
+    }
+  } else {
+    if (p === game.player) p.onGround = false;
+  }
+
+  // Damage smoke
+  if (p.hp < p.maxHp * 0.4 && p.alive && p === game.player) {
+    p.smokeTimer++;
+    if (p.smokeTimer % 3 === 0) {
+      const backX = p.x - Math.cos(p.angle) * 20;
+      const backY = p.y - Math.sin(p.angle) * 20;
+      spawnParticles(backX, backY, 1, {
+        vxRange: 0.3, vyRange: 0.3, lifeRange: [15,30], sizeRange: [3,6],
+        grow: 0.2, colors: [[80,80,80],[60,60,60],[40,40,40]], type: 'smoke', gravity: -0.01
+      });
+    }
+  }
+}
+
+function crashPlane(p) {
+  if (!p.alive) return;
+  p.alive = false;
+  spawnExplosion(p.x, p.y, 1.5);
+  triggerShake(1.0);
+  SFX.die();
+  if (p === game.player) {
+    game.lives--;
+    p.respawnTimer = 120;
+    if (game.lives <= 0) {
+      game.state = 'gameover';
+      SFX.gameOver();
+    }
+  }
+}
+
+function destroyEnemy(e) {
+  if (!e.alive) return;
+  e.alive = false;
+  spawnExplosion(e.x, e.y, 1.2);
+  triggerShake(0.5);
+  SFX.explosion();
+  game.score += CFG.SCORE_ENEMY;
+}
+
+function drawBiplane(ctx, p, playerColor = true) {
+  if (!p.alive) return;
+  // Invincibility flash
+  if (p === game.player && p.invincible > 0 && Math.floor(p.invincible / 3) % 2 === 0) return;
+
+  const pos = worldToScreen(p.x, p.y);
+  const sx = pos.x, sy = pos.y;
+
+  ctx.save();
+  ctx.translate(sx, sy);
+  ctx.rotate(p.displayAngle);
+
+  const isEnemy = p !== game.player;
+
+  // === PROPELLER (behind everything) ===
+  const propPhase = p.enginePhase;
+  const propTip = 5 + Math.sin(propPhase * 3) * 8;
+  ctx.strokeStyle = 'rgba(200,200,200,0.7)';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.moveTo(22, -2 - propTip);
+  ctx.lineTo(22, 2 + propTip);
+  ctx.moveTo(22 - propTip, 0);
+  ctx.lineTo(22 + propTip, 0);
+  ctx.stroke();
+  // Propeller blur
+  ctx.fillStyle = 'rgba(200,200,220,0.15)';
+  ctx.beginPath();
+  ctx.ellipse(22, 0, 3, 10 + Math.abs(Math.sin(propPhase * 3)) * 5, 0, 0, TAU);
+  ctx.fill();
+
+  // === FUSELAGE ===
+  const bodyColor = playerColor ? '#0cf' : '#f44';
+  const bodyDark = playerColor ? '#099' : '#922';
+  ctx.fillStyle = bodyColor;
+  ctx.strokeStyle = '#fff';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.moveTo(24, 0);      // nose
+  ctx.lineTo(18, -4);
+  ctx.lineTo(-10, -5);    // top of body
+  ctx.lineTo(-22, -3);    // tail top
+  ctx.lineTo(-24, 0);     // tail tip
+  ctx.lineTo(-22, 3);     // tail bottom
+  ctx.lineTo(-10, 5);     // bottom of body
+  ctx.lineTo(18, 4);
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+
+  // === TOP WING ===
+  ctx.fillStyle = playerColor ? '#2af' : '#d33';
+  ctx.strokeStyle = playerColor ? '#6cf' : '#f66';
+  ctx.beginPath();
+  ctx.moveTo(-16, -5);
+  ctx.lineTo(18, -5);
+  ctx.lineTo(18, -12);
+  ctx.lineTo(-16, -12);
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+  // Wing struts
+  ctx.strokeStyle = '#888';
+  ctx.lineWidth = 1;
+  for (const wx of [-10, 0, 10]) {
+    ctx.beginPath();
+    ctx.moveTo(wx, -5);
+    ctx.lineTo(wx, 5);
+    ctx.stroke();
+  }
+
+  // === BOTTOM WING ===
+  ctx.fillStyle = playerColor ? '#29d' : '#c22';
+  ctx.strokeStyle = playerColor ? '#5af' : '#e44';
+  ctx.beginPath();
+  ctx.moveTo(-14, 5);
+  ctx.lineTo(16, 5);
+  ctx.lineTo(16, 11);
+  ctx.lineTo(-14, 11);
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+
+  // === TAIL ===
+  ctx.fillStyle = playerColor ? '#08c' : '#a11';
+  ctx.beginPath();
+  ctx.moveTo(-22, -3);
+  ctx.lineTo(-32, -10);
+  ctx.lineTo(-30, -3);
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+  // Bottom fin
+  ctx.beginPath();
+  ctx.moveTo(-20, 3);
+  ctx.lineTo(-28, 8);
+  ctx.lineTo(-26, 3);
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+
+  // === COCKPIT ===
+  ctx.fillStyle = playerColor ? 'rgba(0,200,255,0.3)' : 'rgba(255,50,50,0.3)';
+  ctx.beginPath();
+  ctx.ellipse(4, -2, 6, 4, 0.1, 0, TAU);
+  ctx.fill();
+  ctx.fillStyle = playerColor ? 'rgba(0,255,255,0.2)' : 'rgba(255,100,100,0.2)';
+  ctx.beginPath();
+  ctx.ellipse(4, -2, 4, 2.5, 0.1, 0, TAU);
+  ctx.fill();
+
+  // === LANDING GEAR ===
+  ctx.strokeStyle = '#999';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.moveTo(2, 5);
+  ctx.lineTo(2, 12);
+  ctx.moveTo(10, 5);
+  ctx.lineTo(10, 12);
+  ctx.stroke();
+  // Wheels
+  ctx.fillStyle = '#555';
+  for (const wx of [2, 10]) {
+    ctx.beginPath();
+    ctx.arc(wx, 13, 3, 0, TAU);
+    ctx.fill();
+    ctx.strokeStyle = '#888';
+    ctx.stroke();
+  }
+
+  // === ENGINE GLOW (when thrusting) ===
+  if (p.thrust > 0.3) {
+    const glowSize = 2 + p.thrust * 4;
+    ctx.fillStyle = playerColor
+      ? `rgba(255,200,50,${0.2 + p.thrust * 0.3})`
+      : `rgba(255,50,50,${0.2 + p.thrust * 0.3})`;
+    ctx.beginPath();
+    ctx.arc(22, 0, glowSize, 0, TAU);
+    ctx.fill();
+  }
+
+  // === ENEMY MARKER ===
+  if (isEnemy) {
+    ctx.fillStyle = '#f44';
+    ctx.font = 'bold 8px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('✕', 0, -16);
+  }
+
+  ctx.restore();
+}
+
+// =========================================================
+// SECTION 10 — ENEMY AI
+// =========================================================
+function updateEnemyAI(e) {
+  if (!e.alive) return;
+
+  const pl = game.player;
+  if (!pl.alive) {
+    // Free roam if player is dead
+    e.angle = Math.sin(e.enginePhase * 0.02) * 0.3;
+    e.thrust = 0.5;
+    updatePlanePhysics(e);
+    return;
+  }
+
+  const dx = worldDelta(pl.x, e.x);
+  const dy = pl.y - e.y;
+  const distToPlayer = Math.sqrt(dx * dx + dy * dy);
+
+  // State machine
+  e.turnTimer--;
+
+  if (e.state === 'patrol') {
+    // Fly mostly level, slight wandering
+    e.thrust = 0.5 + 0.3 * Math.sin(e.enginePhase * 0.01);
+    e.angle = Math.sin(e.enginePhase * 0.015) * 0.3;
+
+    // Transition to chase when player is close
+    if (distToPlayer < 400) {
+      e.state = 'chase';
+      e.turnTimer = 120;
+    }
+  } else if (e.state === 'chase') {
+    // Fly toward the player
+    const targetAngle = Math.atan2(dy, dx);
+    let diff = targetAngle - e.angle;
+    if (diff > PI) diff -= TAU;
+    if (diff < -PI) diff += TAU;
+    e.angle += clamp(diff, -0.05, 0.05);
+    e.thrust = 0.7 + 0.3 * (distToPlayer > 300 ? 1 : -0.5);
+
+    // Dive if player is below
+    if (dy > 30 && distToPlayer < 250) {
+      e.state = 'dive';
+      e.diveTimer = 40;
+    }
+
+    // Give up chase if too far
+    if (distToPlayer > 700) {
+      e.state = 'patrol';
+    }
+  } else if (e.state === 'dive') {
+    e.angle = 0.6 + Math.sin(e.enginePhase * 0.1) * 0.2;
+    e.thrust = 1.0;
+    e.diveTimer--;
+    if (e.diveTimer <= 0) {
+      e.state = 'climb';
+      e.turnTimer = 30;
+    }
+  } else if (e.state === 'climb') {
+    e.angle = -0.4 - Math.sin(e.enginePhase * 0.05) * 0.3;
+    e.thrust = 0.8;
+    e.turnTimer--;
+    if (e.turnTimer <= 0) {
+      e.state = 'chase';
+    }
+  }
+
+  // Fire at player when in range and facing them
+  e.fireCooldown--;
+  if (e.fireCooldown <= 0 && distToPlayer < 400) {
+    const angleDiff = Math.abs(e.angle - Math.atan2(dy, dx));
+    if (angleDiff < 0.5 || angleDiff > TAU - 0.5) {
+      e.fireCooldown = 60 + Math.floor(srand() * 60);
+      // Enemy bullets
+      const bx = e.x + Math.cos(e.angle) * 24;
+      const by = e.y + Math.sin(e.angle) * 24;
+      const bvx = Math.cos(e.angle) * 5 + e.vx * 0.3;
+      const bvy = Math.sin(e.angle) * 5 + e.vy * 0.3;
+      bullets.push({ x: bx, y: by, vx: bvx, vy: bvy, life: 80, enemy: true });
+      playTone(400, 0.04, 'square', 0.04);
+    }
+  }
+
+  updatePlanePhysics(e);
+
+  // Keep enemy above terrain with some margin
+  const groundY = getTerrainHeight(e.x);
+  if (e.y > groundY - 30) {
+    e.angle = -0.3;
+    e.thrust = 1.0;
+  }
+
+  // Prevent flying too high
+  if (e.y < 50) {
+    e.angle = 0.3;
+  }
+}
+
+// =========================================================
+// SECTION 11 — GAME STATE & MAIN LOOP
+// =========================================================
+const game = {
+  state: 'playing', // playing, gameover
+  score: 0,
+  lives: 3,
+  frame: 0,
+  player: null,
+  enemies: [],
+  targets: [],
+  keys: {},
+  spawnTimer: 0,
+  fuelWarning: false,
+};
+
+function initGame() {
+  game.state = 'playing';
+  game.score = 0;
+  game.lives = 3;
+  game.frame = 0;
+  game.spawnTimer = 0;
+  game.player = createPlayer();
+  game.targets = createTargets();
+  game.enemies = [];
+  game.fuelWarning = false;
+  bullets = [];
+  bombs = [];
+  flak = [];
+  // Clear particles
+  for (let i = 0; i < MAX_PARTICLES; i++) {
+    particlePool[i].alive = false;
+  }
+  activeParticles = 0;
+  camera.x = game.player.x;
+  camera.y = game.player.y;
+  camera.shake = 0;
+}
+
+function updateAA(target) {
+  if (!target.alive) return;
+  const pl = game.player;
+  if (!pl.alive) return;
+
+  const dx = worldDelta(pl.x, target.x);
+  const dy = pl.y - target.y;
+  const dist = Math.sqrt(dx * dx + dy * dy);
+
+  target.cooldown--;
+  if (target.cooldown <= 0 && dist < 500 && dy < -20) {
+    target.cooldown = 90 + Math.floor(srand() * 60);
+    // Fire flak toward player's predicted position
+    const leadX = dx + pl.vx * 10;
+    const leadY = dy + pl.vy * 10;
+    fireFlak(target.x, target.y - 10, target.x + leadX, target.y - 10 + leadY);
+  }
+}
+
+function checkBulletHits() {
+  const pl = game.player;
+  for (let i = bullets.length - 1; i >= 0; i--) {
+    const b = bullets[i];
+    const bGround = getTerrainHeight(b.x);
+    if (b.y > bGround) { bullets.splice(i, 1); continue; }
+
+    // Check vs targets (player bullets only)
+    if (!b.enemy) {
+      for (const t of game.targets) {
+        if (!t.alive) continue;
+        if (dist(b.x, b.y, t.x, t.y) < Math.max(t.w, t.h) * 0.6) {
+          // Bullets can't destroy factories (bomb only)
+          if (t.type === 'factory') {
+            t.hp--; SFX.hit();
+            spawnParticles(b.x, b.y, 4, {
+              vxRange: 1, vyRange: 1, lifeRange: [8,15], sizeRange: [1,3],
+              colors: [[255,200,50]], gravity: 0.03
+            });
+          } else {
+            t.hp--;
+            if (t.hp <= 0) {
+              destroyTarget(t);
+            } else {
+              SFX.hit();
+              spawnParticles(b.x, b.y, 6, {
+                vxRange: 2, vyRange: 2, lifeRange: [10,20], sizeRange: [1,3],
+                colors: [[255,200,50],[255,100,20]], gravity: 0.03
+              });
+            }
+          }
+          bullets.splice(i, 1);
+          break;
+        }
+      }
+    }
+
+    // Don't process further if bullet was removed
+    if (i >= bullets.length || bullets[i] !== b) continue;
+
+    // Check vs player (enemy bullets)
+    if (b.enemy && pl.alive && pl.invincible <= 0) {
+      if (dist(b.x, b.y, pl.x, pl.y) < 16) {
+        pl.hp -= 5 + Math.floor(srand() * 5);
+        SFX.hit();
+        spawnParticles(b.x, b.y, 6, {
+          vxRange: 2, vyRange: 2, lifeRange: [10,20], sizeRange: [1,3],
+          colors: [[0,200,255],[0,255,255]], gravity: 0.03
+        });
+        triggerShake(0.2);
+        bullets.splice(i, 1);
+        if (pl.hp <= 0) crashPlane(pl);
+        continue;
+      }
+    }
+
+    // Check vs enemies (player bullets)
+    if (!b.enemy) {
+      for (const e of game.enemies) {
+        if (!e.alive) continue;
+        if (dist(b.x, b.y, e.x, e.y) < 18) {
+          e.hp--;
+          spawnParticles(b.x, b.y, 4, {
+            vxRange: 1, vyRange: 1, lifeRange: [8,15], sizeRange: [1,3],
+            colors: [[255,255,100],[255,100,50]], gravity: 0.02
+          });
+          if (e.hp <= 0) {
+            destroyEnemy(e);
+          } else {
+            SFX.hit();
+          }
+          bullets.splice(i, 1);
+          break;
+        }
+      }
+    }
+  }
+}
+
+function checkFlakHits() {
+  const pl = game.player;
+  if (!pl.alive || pl.invincible > 0) return;
+  for (let i = flak.length - 1; i >= 0; i--) {
+    const f = flak[i];
+    if (dist(f.x, f.y, pl.x, pl.y) < 12) {
+      pl.hp -= 2 + Math.floor(srand() * 3);
+      SFX.hit();
+      spawnParticles(f.x, f.y, 5, {
+        vxRange: 2, vyRange: 2, lifeRange: [8,18], sizeRange: [1,2],
+        colors: [[255,255,100],[255,150,50]], gravity: 0.03
+      });
+      triggerShake(0.15);
+      flak.splice(i, 1);
+      if (pl.hp <= 0) crashPlane(pl);
+    }
+  }
+}
+
+function checkPlayerBulletCollision() {
+  // Player colliding with enemy bullets
+  const pl = game.player;
+  if (!pl.alive || pl.invincible > 0) return;
+  for (let i = bullets.length - 1; i >= 0; i--) {
+    const b = bullets[i];
+    if (!b.enemy) continue;
+    if (dist(b.x, b.y, pl.x, pl.y) < 14) {
+      pl.hp -= 6;
+      SFX.hit();
+      spawnParticles(b.x, b.y, 4, { vxRange: 1.5, vyRange: 1.5, lifeRange: [8,15], sizeRange: [1,2], colors: [[0,200,255]], gravity: 0.03 });
+      triggerShake(0.2);
+      bullets.splice(i, 1);
+      if (pl.hp <= 0) crashPlane(pl);
+    }
+  }
+}
+
+function spawnEnemy() {
+  if (game.enemies.length >= CFG.MAX_ENEMIES) return;
+  // Spawn off-screen, relative to camera
+  const spawnX = wrapX(camera.x + (srand() > 0.5 ? -400 : 400));
+  const spawnY = 50 + srand() * 150;
+  const enemy = createEnemy(spawnX, spawnY);
+  if (enemy.y < getTerrainHeight(enemy.x) - 30) {
+    game.enemies.push(enemy);
+  }
+}
+
+// =========================================================
+// SECTION 12 — RENDERING
+// =========================================================
+let canvas, ctx;
+
+function drawBackground() {
+  const cw = CFG.CANVAS_W, ch = CFG.CANVAS_H;
+  const skyGrad = ctx.createLinearGradient(0, 0, 0, ch * 0.7);
+  skyGrad.addColorStop(0, '#06061a');
+  skyGrad.addColorStop(0.3, '#0a0a2e');
+  skyGrad.addColorStop(0.6, '#0e0e38');
+  skyGrad.addColorStop(1, '#12123a');
+  ctx.fillStyle = skyGrad;
+  ctx.fillRect(0, 0, cw, ch);
+
+  // Stars (parallax)
+  const starSpeed = 0.02;
+  const starCount = 200;
+  for (let i = 0; i < starCount; i++) {
+    const sx = ((i * 137.508 + i * i * 0.5) % cw - camera.x * starSpeed * (0.5 + (i % 5) * 0.1)) % cw;
+    const sy = (i * 73.1) % (ch * 0.6);
+    const brightness = 0.3 + 0.7 * ((i % 100) / 100);
+    const twinkle = 0.7 + 0.3 * Math.sin(game.frame * 0.02 + i);
+    ctx.globalAlpha = brightness * twinkle * 0.6;
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(sx < 0 ? sx + cw : sx, sy, 1 + (i % 2), 1 + (i % 2));
+  }
+  ctx.globalAlpha = 1;
+
+  // Parallax mountains (3 layers)
+  const layers = [
+    { speed: 0.03, amp: 35, freq: 0.004, base: 80, color: '#0a0a2e', color2: '#080828' },
+    { speed: 0.08, amp: 25, freq: 0.007, base: 50, color: '#10103a', color2: '#0c0c30' },
+    { speed: 0.18, amp: 20, freq: 0.012, base: 40, color: '#16164a', color2: '#12123c' },
+  ];
+  for (const layer of layers) {
+    ctx.fillStyle = layer.color;
+    ctx.beginPath();
+    ctx.moveTo(0, ch);
+    for (let sx = 0; sx <= cw; sx += 3) {
+      const wx = sx + camera.x * layer.speed;
+      const mh = layer.base
+        + Math.sin(wx * layer.freq) * layer.amp
+        + Math.sin(wx * layer.freq * 2.7 + 1.3) * layer.amp * 0.5
+        + Math.sin(wx * layer.freq * 5.3 + 0.7) * layer.amp * 0.25;
+      ctx.lineTo(sx, ch * 0.7 - mh);
+    }
+    ctx.lineTo(cw, ch);
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  // Moon
+  const moonX = ((camera.x * 0.008) % (cw + 200) + cw) % cw - 100;
+  const moonY = 50 + Math.sin(camera.x * 0.001) * 15;
+  ctx.fillStyle = '#ddddcc';
+  ctx.beginPath();
+  ctx.arc(moonX, moonY, 22, 0, TAU);
+  ctx.fill();
+  const glow = ctx.createRadialGradient(moonX, moonY, 8, moonX, moonY, 60);
+  glow.addColorStop(0, 'rgba(200,200,180,0.15)');
+  glow.addColorStop(1, 'transparent');
+  ctx.fillStyle = glow;
+  ctx.beginPath();
+  ctx.arc(moonX, moonY, 60, 0, TAU);
+  ctx.fill();
+  // Moon craters
+  ctx.fillStyle = 'rgba(200,200,180,0.3)';
+  for (const [cx, cy, cr] of [[-6, -5, 4], [8, 3, 3], [3, -8, 2.5]]) {
+    ctx.beginPath();
+    ctx.arc(moonX + cx, moonY + cy, cr, 0, TAU);
+    ctx.fill();
+  }
+}
+
+function drawTerrain() {
+  const cw = CFG.CANVAS_W, ch = CFG.CANVAS_H;
+  const cx = camera.x, cy = camera.y;
+
+  // Main terrain fill
+  const groundGrad = ctx.createLinearGradient(0, ch * 0.6, 0, ch);
+  groundGrad.addColorStop(0, '#1a1a0a');
+  groundGrad.addColorStop(0.3, '#121206');
+  groundGrad.addColorStop(1, '#080803');
+  ctx.fillStyle = groundGrad;
+
+  ctx.beginPath();
+  ctx.moveTo(0, ch);
+  for (let sx = 0; sx <= cw; sx += 2) {
+    const wx = wrapX(cx + worldDelta(sx + cx, cx));
+    const ty = getTerrainHeight(wx);
+    const screenY = ch / 2 + (ty - cy) + camera.shakeY;
+    ctx.lineTo(sx, screenY);
+  }
+  ctx.lineTo(cw, ch);
+  ctx.closePath();
+  ctx.fill();
+
+  // Terrain surface line (bright)
+  ctx.beginPath();
+  for (let sx = 0; sx <= cw; sx += 1) {
+    const wx = wrapX(cx + worldDelta(sx + cx, cx));
+    const ty = getTerrainHeight(wx);
+    const screenY = ch / 2 + (ty - cy) + camera.shakeY;
+    sx === 0 ? ctx.moveTo(sx, screenY) : ctx.lineTo(sx, screenY);
+  }
+  ctx.strokeStyle = '#4a4a2a';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+
+  // Surface highlight
+  ctx.beginPath();
+  for (let sx = 0; sx <= cw; sx += 2) {
+    const wx = wrapX(cx + worldDelta(sx + cx, cx));
+    const ty = getTerrainHeight(wx) - 1;
+    const screenY = ch / 2 + (ty - cy) + camera.shakeY;
+    sx === 0 ? ctx.moveTo(sx, screenY) : ctx.lineTo(sx, screenY);
+  }
+  ctx.strokeStyle = 'rgba(80,200,80,0.15)';
+  ctx.lineWidth = 1;
+  ctx.stroke();
+
+  // Runway markings
+  const baseX = CFG.HOME_BASE_X;
+  const halfR = CFG.RUNWAY_LEN / 2;
+  const rwyY = getTerrainHeight(baseX);
+  const rwyScreen = worldToScreen(baseX - halfR, rwyY);
+  const rwyScreen2 = worldToScreen(baseX + halfR, rwyY);
+  const rwySX = Math.min(rwyScreen.x, rwyScreen2.x);
+  const rwyEX = Math.max(rwyScreen.x, rwyScreen2.x);
+  const rwySY = rwyScreen.y;
+
+  // Only draw if visible on screen
+  if (rwyEX > -50 && rwySX < cw + 50) {
+    ctx.fillStyle = 'rgba(60,60,40,0.6)';
+    ctx.fillRect(rwySX, rwySY - 2, rwyEX - rwySX, 8);
+    // Runway stripes
+    ctx.fillStyle = 'rgba(200,200,150,0.4)';
+    const stripeW = 20, gap = 40;
+    for (let sx = rwySX + 20; sx < rwyEX - 20; sx += stripeW + gap) {
+      ctx.fillRect(sx, rwySY, stripeW, 3);
+    }
+    // Base label
+    ctx.fillStyle = 'rgba(150,255,150,0.5)';
+    ctx.font = '10px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('▼ HOME BASE', (rwySX + rwyEX) / 2, rwySY - 10);
+  }
+}
+
+function drawTargets() {
+  for (const t of game.targets) {
+    if (!t.alive) continue;
+    const pos = worldToScreen(t.x, t.y);
+    if (pos.x < -60 || pos.x > CFG.CANVAS_W + 60) continue;
+    t.drawFn(ctx, t, pos.x, pos.y);
+  }
+}
+
+function drawFlak() {
+  for (const f of flak) {
+    const pos = worldToScreen(f.x, f.y);
+    const alpha = f.life / 60;
+    ctx.fillStyle = `rgba(255,200,50,${alpha * 0.7})`;
+    ctx.beginPath();
+    ctx.arc(pos.x, pos.y, 2, 0, TAU);
+    ctx.fill();
+    ctx.fillStyle = `rgba(255,100,0,${alpha * 0.3})`;
+    ctx.beginPath();
+    ctx.arc(pos.x, pos.y, 4, 0, TAU);
+    ctx.fill();
+  }
+}
+
+function drawProjectiles() {
+  // Bullets
+  for (const b of bullets) {
+    const pos = worldToScreen(b.x, b.y);
+    const color = b.enemy ? '#f44' : '#ff4';
+    ctx.fillStyle = color;
+    ctx.shadowColor = color;
+    ctx.shadowBlur = 6;
+    ctx.fillRect(pos.x - 1, pos.y - 1, 3, 3);
+    ctx.shadowBlur = 0;
+  }
+  // Bombs
+  for (const b of bombs) {
+    const pos = worldToScreen(b.x, b.y);
+    ctx.fillStyle = '#666';
+    ctx.fillRect(pos.x - 2, pos.y - 3, 4, 6);
+    ctx.fillStyle = '#888';
+    ctx.fillRect(pos.x - 1, pos.y - 2, 2, 4);
+    // Fins
+    ctx.fillStyle = '#555';
+    ctx.fillRect(pos.x - 3, pos.y - 3, 1, 2);
+    ctx.fillRect(pos.x + 2, pos.y - 3, 1, 2);
+  }
+}
+
+function drawHUD() {
+  const p = game.player;
+  const cw = CFG.CANVAS_W, ch = CFG.CANVAS_H;
+
+  // Top bar background
+  ctx.fillStyle = 'rgba(0,0,0,0.6)';
+  ctx.fillRect(0, 0, cw, 32);
+  ctx.fillStyle = 'rgba(0,255,255,0.1)';
+  ctx.fillRect(0, 31, cw, 1);
+
+  // Score
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 14px monospace';
+  ctx.textAlign = 'left';
+  ctx.fillText(`SCORE: ${game.score}`, 12, 22);
+
+  // Lives
+  ctx.fillStyle = '#f44';
+  ctx.font = '12px monospace';
+  ctx.fillText(`♥×${game.lives}`, cw / 2 - 25, 22);
+
+  // Fuel gauge
+  const fuelPct = p.fuel / CFG.MAX_FUEL;
+  const fuelColor = fuelPct < 0.2 ? '#f44' : fuelPct < 0.4 ? '#ff0' : '#0f0';
+  ctx.fillStyle = 'rgba(255,255,255,0.1)';
+  ctx.fillRect(cw / 2 + 30, 8, 120, 16);
+  ctx.fillStyle = fuelColor;
+  ctx.fillRect(cw / 2 + 32, 10, 116 * fuelPct, 12);
+  ctx.fillStyle = '#fff';
+  ctx.font = '9px monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText('FUEL', cw / 2 + 90, 16);
+
+  // Right side stats
+  ctx.textAlign = 'right';
+  ctx.fillStyle = '#8af';
+  ctx.font = '12px monospace';
+  ctx.fillText(`BULLETS: ${p.bullets}`, cw - 12, 14);
+  ctx.fillText(`BOMBS: ${p.bombs}`, cw - 12, 28);
+
+  // Speed indicator (bottom-left)
+  const speed = Math.sqrt(p.vx * p.vx + p.vy * p.vy);
+  ctx.fillStyle = 'rgba(0,0,0,0.5)';
+  ctx.fillRect(8, ch - 28, 120, 20);
+  ctx.fillStyle = '#fff';
+  ctx.font = '10px monospace';
+  ctx.textAlign = 'left';
+  ctx.fillText(`SPD ${speed.toFixed(1)}`, 14, ch - 14);
+  const stall = speed < CFG.STALL_SPEED;
+  if (stall) {
+    ctx.fillStyle = '#f44';
+    ctx.font = 'bold 12px monospace';
+    ctx.fillText('⚠ STALL', 90, ch - 14);
+  }
+
+  // HP bar (bottom-center)
+  const hpPct = p.hp / p.maxHp;
+  const hpColor = hpPct < 0.3 ? '#f44' : hpPct < 0.6 ? '#ff0' : '#0f0';
+  ctx.fillStyle = 'rgba(0,0,0,0.5)';
+  ctx.fillRect(cw / 2 - 60, ch - 24, 120, 16);
+  ctx.fillStyle = hpColor;
+  ctx.fillRect(cw / 2 - 58, ch - 22, 116 * hpPct, 12);
+  ctx.fillStyle = '#fff';
+  ctx.font = '9px monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText('HP', cw / 2, ch - 14);
+
+  // On-ground indicator
+  if (p.onGround) {
+    ctx.fillStyle = '#0f0';
+    ctx.font = 'bold 14px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('▪ LANDED — REFUELING ▪', cw / 2, ch - 40);
+  }
+
+  // Low fuel warning
+  if (fuelPct < 0.2 && p.alive) {
+    ctx.fillStyle = `rgba(255,0,0,${0.3 + 0.3 * Math.sin(game.frame * 0.1)})`;
+    ctx.font = 'bold 16px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('⚠ LOW FUEL', cw / 2, 56);
+  }
+
+  // Enemy count
+  ctx.textAlign = 'left';
+  ctx.fillStyle = '#888';
+  ctx.font = '9px monospace';
+  ctx.fillText(`ENEMIES: ${game.enemies.filter(e => e.alive).length}`, 12, ch - 8);
+
+  ctx.textAlign = 'right';
+  ctx.fillText(`TARGETS: ${game.targets.filter(t => t.alive).length}`, cw - 12, ch - 8);
+}
+
+function drawGameOver() {
+  const cw = CFG.CANVAS_W, ch = CFG.CANVAS_H;
+  ctx.fillStyle = 'rgba(0,0,0,0.7)';
+  ctx.fillRect(0, 0, cw, ch);
+
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#f44';
+  ctx.font = 'bold 48px monospace';
+  ctx.fillText('GAME OVER', cw / 2, ch / 2 - 40);
+
+  ctx.fillStyle = '#fff';
+  ctx.font = '24px monospace';
+  ctx.fillText(`SCORE: ${game.score}`, cw / 2, ch / 2 + 20);
+
+  ctx.fillStyle = '#8af';
+  ctx.font = '16px monospace';
+  ctx.fillText('CLICK or TAP to restart', cw / 2, ch / 2 + 70);
+
+  // Scores
+  ctx.fillStyle = '#666';
+  ctx.font = '12px monospace';
+  const targetsDestroyed = CFG.SCORE_OIL > 0 ? Math.floor(game.score / CFG.SCORE_ENEMY) : 0;
+  ctx.fillText('Thanks for playing!', cw / 2, ch / 2 + 110);
+}
+
+// =========================================================
+// SECTION 13 — GAME UPDATE
+// =========================================================
+function update() {
+  const p = game.player;
+  game.frame++;
+
+  // === Respawn ===
+  if (!p.alive && p.respawnTimer > 0) {
+    p.respawnTimer--;
+    if (p.respawnTimer === 0 && game.lives > 0 && game.state === 'playing') {
+      // Respawn at home base
+      const baseY = getTerrainHeight(CFG.HOME_BASE_X) - 60;
+      p.x = CFG.HOME_BASE_X;
+      p.y = baseY;
+      p.vx = 3;
+      p.vy = 0;
+      p.angle = 0;
+      p.displayAngle = 0;
+      p.thrust = 0.5;
+      p.hp = p.maxHp;
+      p.alive = true;
+      p.invincible = 90;
+      p.onGround = false;
+      p.fuel = Math.max(p.fuel, CFG.MAX_FUEL * 0.3);
+    }
+  }
+
+  if (game.state === 'gameover') return;
+
+  if (!p.alive) return;
+
+  // === Player Input ===
+  if (game.keys['x'] || game.keys['X']) p.thrust = Math.min(1, p.thrust + 0.015);
+  else p.thrust = Math.max(0.1, p.thrust - 0.005);
+
+  if (game.keys['z'] || game.keys['Z']) p.vx *= 0.95;
+
+  // Firing
+  if (p.fireCooldown > 0) p.fireCooldown--;
+  if (p.bombCooldown > 0) p.bombCooldown--;
+
+  if (game.keys[' '] && p.fireCooldown === 0 && p.alive) {
+    const bx = p.x + Math.cos(p.angle) * 24;
+    const by = p.y + Math.sin(p.angle) * 24;
+    fireBullet(bx, by, p.angle);
+    p.fireCooldown = CFG.FIRE_RATE;
+  }
+
+  if ((game.keys['b'] || game.keys['B']) && p.bombCooldown === 0 && p.alive) {
+    dropBomb(p.x, p.y, p.vx, p.vy);
+    p.bombCooldown = CFG.BOMB_COOLDOWN;
+  }
+
+  // === Fuel ===
+  if (!p.onGround) {
+    p.fuel -= CFG.FUEL_BURN * (0.5 + p.thrust);
+    if (p.fuel <= 0) {
+      p.fuel = 0;
+      p.thrust = 0;
+    }
+  }
+
+  // === Invincibility ===
+  if (p.invincible > 0) p.invincible--;
+
+  // === Update Player Physics ===
+  updatePlanePhysics(p);
+
+  // === Enemies ===
+  game.spawnTimer++;
+  if (game.spawnTimer >= CFG.SPAWN_INTERVAL) {
+    game.spawnTimer = 0;
+    spawnEnemy();
+  }
+
+  for (const e of game.enemies) {
+    updateEnemyAI(e);
+  }
+  // Remove dead enemies after explosion finishes
+  game.enemies = game.enemies.filter(e => e.alive || e.hp > -10);
+
+  // === AA Guns ===
+  for (const t of game.targets) {
+    if (t.type === 'aa') updateAA(t);
+  }
+
+  // === Projectiles ===
+  updateProjectiles();
+
+  // === Collisions ===
+  checkBulletHits();
+  checkFlakHits();
+  checkPlayerBulletCollision();
+
+  // === Camera ===
+  const targetX = p.alive ? p.x : CFG.HOME_BASE_X;
+  const targetY = p.alive ? p.y - 30 : getTerrainHeight(CFG.HOME_BASE_X) - 80;
+  updateCamera(targetX, targetY);
+
+  // === Particles ===
+  updateParticles();
+
+  // === Engine Sound (throttle-based) ===
+  if (p.alive && p.thrust > 0.1 && game.frame % 4 === 0) {
+    const freq = 80 + p.thrust * 60 + Math.sin(p.enginePhase * 2) * 10;
+    if (!muted) playTone(freq, 0.06, 'sawtooth', 0.015);
+  }
+}
+
+// =========================================================
+// SECTION 14 — RENDER (Full Frame)
+// =========================================================
+function render() {
+  ctx.clearRect(0, 0, CFG.CANVAS_W, CFG.CANVAS_H);
+
+  drawBackground();
+  drawTerrain();
+  drawTargets();
+  drawProjectiles();
+  drawFlak();
+
+  // Enemies
+  for (const e of game.enemies) {
+    drawBiplane(ctx, e, false);
+  }
+
+  // Player
+  drawBiplane(ctx, game.player, true);
+
+  // Particles (on top of everything)
+  drawParticles(ctx, camera.x, camera.y);
+
+  // HUD
+  drawHUD();
+
+  if (game.state === 'gameover') {
+    drawGameOver();
+  }
+}
+
+// =========================================================
+// SECTION 15 — GAME LOOP
+// =========================================================
+let lastTime = 0;
+const TICK_MS = 16.667; // ~60fps
+
+function gameLoop(currentTime) {
+  const deltaTime = currentTime - lastTime;
+  lastTime = currentTime;
+
+  const clampedDelta = Math.min(deltaTime, 50); // cap to prevent spiral of death
+
+  if (game.state !== 'gameover') {
+    update();
+  }
+  render();
+
+  requestAnimationFrame(gameLoop);
+}
+
+// =========================================================
+// SECTION 16 — INPUT HANDLING
+// =========================================================
+function setupInput() {
+  document.addEventListener('keydown', (e) => {
+    // Prevent default for game keys
+    if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', ' ', 'x', 'X', 'z', 'Z', 'b', 'B'].includes(e.key)) {
+      e.preventDefault();
+    }
+    game.keys[e.key] = true;
+    initAudio();
+
+    // Restart on game over
+    if (game.state === 'gameover' && e.key === ' ') {
+      initGame();
+    }
+  });
+
+  document.addEventListener('keyup', (e) => {
+    game.keys[e.key] = false;
+  });
+
+  // Start overlay click
+  document.getElementById('startOverlay').addEventListener('click', () => {
+    initAudio();
+    document.getElementById('startOverlay').style.display = 'none';
+    if (game.state === 'gameover') initGame();
+  });
+
+  // Canvas click for restart
+  canvas.addEventListener('click', () => {
+    initAudio();
+    if (game.state === 'gameover') {
+      initGame();
+    }
+  });
+}
+
+// =========================================================
+// SECTION 17 — INITIALIZATION
+// =========================================================
+function main() {
+  canvas = document.getElementById('gameCanvas');
+  ctx = canvas.getContext('2d');
+
+  function resize() {
+    CFG.CANVAS_W = canvas.width = window.innerWidth;
+    CFG.CANVAS_H = canvas.height = window.innerHeight;
+    terrainBase = canvas.height * 0.68;
+    // Regenerate terrain on resize (base height changed)
+    generateTerrain();
+  }
+
+  window.addEventListener('resize', resize);
+  resize();
+
+  generateTerrain();
+  initGame();
+  setupInput();
+
+  lastTime = performance.now();
+  requestAnimationFrame(gameLoop);
+}
+
+// Boot
+main();
+</script>
+</body>
+</html>

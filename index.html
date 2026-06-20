@@ -16,7 +16,31 @@ canvas{display:block;width:100%;height:100%;image-rendering:pixelated;touch-acti
 #startOverlay .controls span{color:#ff0}
 #startOverlay .prompt{color:#fff;font-size:clamp(12px,2.2vw,20px);margin-top:32px;animation:pulse 1.5s ease-in-out infinite}
 @keyframes pulse{0%,100%{opacity:.5}50%{opacity:1}}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:0.3}}
 #startOverlay .credits{color:#666;font-size:12px;position:absolute;bottom:24px;text-align:center}
+
+/* === TOUCH CONTROLS (tablet/mobile) === */
+#touchControls{position:fixed;inset:0;pointer-events:none;z-index:5;display:none}
+@media(pointer:coarse){#touchControls{display:block}}
+.touch-pad{position:absolute;left:clamp(8px,3vw,20px);bottom:clamp(12px,4vh,32px);display:flex;flex-direction:column;align-items:center;gap:4px;pointer-events:auto;width:clamp(70px,18vw,110px)}
+.touch-pad .pad-label{color:rgba(0,255,255,0.4);font:bold 9px monospace;letter-spacing:2px;margin-bottom:2px}
+.ctrl-btn{border:2px solid rgba(255,255,255,0.3);border-radius:12px;background:rgba(0,0,0,0.5);color:#fff;font-family:'Courier New',monospace;font-weight:bold;backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px);touch-action:manipulation;user-select:none;-webkit-user-select:none;transition:background .1s,transform .1s;cursor:pointer;outline:none}
+.ctrl-btn:active,.ctrl-btn.pressed{transform:scale(0.92)}
+.btn-up,.btn-down{width:100%;height:clamp(44px,8vh,60px);font-size:clamp(20px,5vw,32px);line-height:1;border-color:rgba(0,255,255,0.3)}
+.btn-up:active,.btn-up.pressed{background:rgba(0,255,255,0.25);border-color:rgba(0,255,255,0.7)}
+.btn-down:active,.btn-down.pressed{background:rgba(0,255,255,0.25);border-color:rgba(0,255,255,0.7)}
+.touch-actions{position:absolute;right:clamp(8px,3vw,20px);bottom:clamp(12px,4vh,32px);display:grid;grid-template-columns:1fr 1fr;gap:clamp(6px,1.5vw,10px);pointer-events:auto;width:clamp(150px,38vw,240px)}
+.touch-actions .ctrl-btn{height:clamp(46px,9vh,64px);font-size:clamp(11px,2.5vw,16px);letter-spacing:1px}
+.btn-fire{background:rgba(200,50,50,0.35);border-color:rgba(255,100,100,0.5)}
+.btn-fire:active,.btn-fire.pressed{background:rgba(255,50,50,0.5);border-color:#f44}
+.btn-accel{background:rgba(50,200,50,0.25);border-color:rgba(100,255,100,0.4)}
+.btn-accel:active,.btn-accel.pressed{background:rgba(50,255,50,0.4);border-color:#4f4}
+.btn-bomb{background:rgba(200,100,20,0.25);border-color:rgba(255,150,50,0.4)}
+.btn-bomb:active,.btn-bomb.pressed{background:rgba(255,150,50,0.4);border-color:#f80}
+.btn-brake{background:rgba(100,100,200,0.25);border-color:rgba(150,150,255,0.4)}
+.btn-brake:active,.btn-brake.pressed{background:rgba(100,100,255,0.4);border-color:#88f}
+.touch-mute{position:fixed;top:clamp(8px,2vw,16px);right:clamp(8px,2vw,16px);pointer-events:auto;width:clamp(36px,6vw,48px);height:clamp(36px,6vw,48px);border-radius:50%;border:2px solid rgba(255,255,255,0.2);background:rgba(0,0,0,0.5);color:#fff;font-size:clamp(16px,3.5vw,24px);display:flex;align-items:center;justify-content:center;cursor:pointer;backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px);user-select:none;z-index:25}
+.touch-mute:active{background:rgba(255,255,255,0.15)}
 </style>
 </head>
 <body>
@@ -25,15 +49,35 @@ canvas{display:block;width:100%;height:100%;image-rendering:pixelated;touch-acti
   <h1>✦ SOPWITH CAMEL ✦</h1>
   <div class="subtitle">— ENHANCED —</div>
   <div class="controls">
+    <span id="ctrlText">
     ↑↓ Pitch &nbsp;|&nbsp; X Accel &nbsp;|&nbsp; Z Brake<br>
     <span>SPACE</span> Fire &nbsp;|&nbsp; <span>B</span> Bomb<br>
+    </span>
     Return to runway to refuel &amp; reload
   </div>
-  <div class="prompt">▸ CLICK or TAP to START ◂</div>
+  <div class="prompt">▸ TAP to START ◂</div>
   <div class="credits">A tribute to the 1984 classic • Built with HTML5 Canvas &amp; Web Audio</div>
 </div>
 
 <canvas id="gameCanvas"></canvas>
+
+<!-- Touch Controls (Fire Tablet / Mobile) -->
+<div id="touchControls">
+  <!-- Left side: virtual D-pad for pitch -->
+  <div class="touch-pad" id="touchPad">
+    <div class="pad-label">PITCH</div>
+    <button class="ctrl-btn btn-up" data-key="ArrowUp">▲</button>
+    <button class="ctrl-btn btn-down" data-key="ArrowDown">▼</button>
+  </div>
+  <!-- Right side: action buttons -->
+  <div class="touch-actions">
+    <button class="ctrl-btn btn-fire" data-key=" ">FIRE</button>
+    <button class="ctrl-btn btn-accel" data-key="x">ACCEL</button>
+    <button class="ctrl-btn btn-bomb"  data-key="b">BOMB</button>
+    <button class="ctrl-btn btn-brake" data-key="z">BRAKE</button>
+  </div>
+  <div class="touch-mute" id="touchMute">🔊</div>
+</div>
 
 <script>
 /* ============================================================
@@ -1741,6 +1785,92 @@ function setupInput() {
       initGame();
     }
   });
+
+  // === TOUCH / POINTER CONTROL SETUP (Fire Tablet / Mobile) ===
+  setupTouchControls();
+}
+
+function setupTouchControls() {
+  const isTouch = window.matchMedia('(pointer: coarse)').matches;
+  if (!isTouch) return; // desktop — skip touch controls
+
+  // Show touch-friendly controls text in start overlay
+  const ctrlText = document.getElementById('ctrlText');
+  if (ctrlText) {
+    ctrlText.innerHTML = '▲▼ Buttons &nbsp;|&nbsp; ACCEL &nbsp;|&nbsp; BRAKE<br>FIRE &nbsp;|&nbsp; BOMB<br>';
+  }
+
+  const touchCtrl = document.getElementById('touchControls');
+  const btns = touchCtrl.querySelectorAll('.ctrl-btn');
+
+  // Pointer Events API — single handler for mouse + touch
+  function onPointerStart(e) {
+    e.preventDefault();
+    const btn = e.currentTarget;
+    const key = btn.dataset.key;
+    btn.classList.add('pressed');
+    game.keys[key] = true;
+    initAudio();
+    if (game.state === 'gameover') {
+      initGame();
+      document.getElementById('startOverlay').style.display = 'none';
+    }
+    try { btn.setPointerCapture(e.pointerId); } catch(_) {}
+  }
+
+  function onPointerEnd(e) {
+    e.preventDefault();
+    const btn = e.currentTarget;
+    const key = btn.dataset.key;
+    btn.classList.remove('pressed');
+    game.keys[key] = false;
+    try { btn.releasePointerCapture(e.pointerId); } catch(_) {}
+  }
+
+  function onPointerCancel(e) {
+    const btn = e.currentTarget;
+    const key = btn.dataset.key;
+    btn.classList.remove('pressed');
+    game.keys[key] = false;
+  }
+
+  for (const btn of btns) {
+    btn.addEventListener('pointerdown', onPointerStart);
+    btn.addEventListener('pointerup', onPointerEnd);
+    btn.addEventListener('pointercancel', onPointerCancel);
+    btn.addEventListener('pointerleave', onPointerCancel);
+    // Click fallback for keyboards-on-tablets
+    btn.addEventListener('click', (e) => { e.preventDefault(); });
+  }
+
+  // Mute toggle
+  const muteBtn = document.getElementById('touchMute');
+  muteBtn.addEventListener('click', () => {
+    muted = !muted;
+    muteBtn.textContent = muted ? '🔇' : '🔊';
+  });
+  muteBtn.addEventListener('pointerdown', (e) => e.preventDefault());
+
+  // Also handle the start overlay with touch
+  const overlay = document.getElementById('startOverlay');
+  if (overlay) {
+    overlay.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      initAudio();
+      overlay.style.display = 'none';
+      if (game.state === 'gameover') initGame();
+    });
+  }
+
+  // Hide touch controls while start overlay is showing
+  if (overlay) {
+    const observer = new MutationObserver(() => {
+      touchCtrl.style.display = overlay.style.display === 'none' ? 'block' : 'none';
+    });
+    observer.observe(overlay, { attributes: true, attributeFilter: ['style'] });
+    // Initial state
+    touchCtrl.style.display = overlay.style.display === 'none' ? 'block' : 'none';
+  }
 }
 
 // =========================================================

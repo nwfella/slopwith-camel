@@ -672,19 +672,20 @@ function destroyTarget(t) {
 // SECTION 9 — PLAYER & ENEMY PLANES
 // =========================================================
 function createPlayer() {
-  const baseY = getTerrainHeight(CFG.HOME_BASE_X) - 60;
+  const spawnX = CFG.HOME_BASE_X - 130; // further back on runway for roll-out
+  const baseY = getTerrainHeight(spawnX) - 8; // ON the ground
   return {
-    x: CFG.HOME_BASE_X, y: baseY,
-    vx: 3, vy: 0,
+    x: spawnX, y: baseY,
+    vx: 0, vy: 0,
     angle: 0, displayAngle: 0,
-    thrust: 0.5,
+    thrust: 0,
     hp: 100, maxHp: 100,
     fuel: CFG.MAX_FUEL,
     bullets: CFG.MAX_BULLETS,
     bombs: CFG.MAX_BOMBS,
     fireCooldown: 0,
     bombCooldown: 0,
-    onGround: false,
+    onGround: true, // starts on the runway
     alive: true,
     respawnTimer: 0,
     invincible: 0,
@@ -778,15 +779,27 @@ function updatePlanePhysics(p) {
       }
       // Stay on ground while on runway
       if (p.onGround) {
-        p.vx *= 0.9;
-        p.vy = 0;
-        p.y = groundY - 8;
-        p.angle = 0;
-        p.displayAngle = 0;
-        // Refuel & reload
-        p.fuel = Math.min(CFG.MAX_FUEL, p.fuel + CFG.REFUEL_RATE);
-        p.bullets = Math.min(CFG.MAX_BULLETS, p.bullets + 2);
-        if (p.bombs < CFG.MAX_BOMBS && game.frame % 20 === 0) p.bombs++;
+        // Check for takeoff: nose pitched up AND enough speed
+        const speed = Math.sqrt(p.vx * p.vx + p.vy * p.vy);
+        if (p.angle < -0.15 && speed > 3.5) {
+          p.onGround = false; // TAKE OFF!
+          spawnParticles(p.x, groundY, 10, {
+            vxRange: 0.5, vyRange: 1, lifeRange: [15,30], sizeRange: [2,4],
+            colors: [[200,180,150],[160,140,100]], gravity: 0.02
+          });
+        } else {
+          // Stay on ground — lighter friction, allow pitch
+          p.vx *= 0.94;
+          p.vy = 0;
+          p.y = groundY - 8;
+          // Don't force angle to 0 — let player pitch up for takeoff
+          p.angle = Math.min(p.angle, 0.3); // clamp nose-down limit
+          p.displayAngle = lerp(p.displayAngle, p.angle, 0.15);
+          // Refuel & reload
+          p.fuel = Math.min(CFG.MAX_FUEL, p.fuel + CFG.REFUEL_RATE);
+          p.bullets = Math.min(CFG.MAX_BULLETS, p.bullets + 2);
+          if (p.bombs < CFG.MAX_BOMBS && game.frame % 20 === 0) p.bombs++;
+        }
       }
     } else {
       // Enemy ground collision = immediate death
@@ -1599,19 +1612,20 @@ function update() {
   if (!p.alive && p.respawnTimer > 0) {
     p.respawnTimer--;
     if (p.respawnTimer === 0 && game.lives > 0 && game.state === 'playing') {
-      // Respawn at home base
-      const baseY = getTerrainHeight(CFG.HOME_BASE_X) - 60;
-      p.x = CFG.HOME_BASE_X;
+      // Respawn at home base — on the ground, further back
+      const spawnX = CFG.HOME_BASE_X - 130;
+      const baseY = getTerrainHeight(spawnX) - 8;
+      p.x = spawnX;
       p.y = baseY;
-      p.vx = 3;
+      p.vx = 0;
       p.vy = 0;
       p.angle = 0;
       p.displayAngle = 0;
-      p.thrust = 0.5;
+      p.thrust = 0;
       p.hp = p.maxHp;
       p.alive = true;
       p.invincible = 90;
-      p.onGround = false;
+      p.onGround = true; // start on the ground
       p.fuel = Math.max(p.fuel, CFG.MAX_FUEL * 0.3);
     }
   }
